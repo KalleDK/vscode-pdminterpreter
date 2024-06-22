@@ -2,7 +2,11 @@
   "name": "pdminterpreter",
   "displayName": "pdminterpreter",
   "description": "Select Interpreter based on PDM",
-  "version": "0.0.3",
+  "version": "0.0.5",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/KalleDK/vscode-pdminterpreter"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -15,17 +19,31 @@
   ],
   "activationEvents": [
     "onLanguage:python",
-    "workspaceContains:.pdm-python",
-    "workspaceContains:*.py"
+    "workspaceContains:.pdm-python"
   ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
       {
         "command": "pdminterpreter.select",
-        "title": "Select Interpreter based on PDM"
+        "title": "PDM Interpreter: Select Interpreter"
+      },
+      {
+        "command": "pdminterpreter.update",
+        "title": "PDM Interpreter: Update Interpreter"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "PDM Interpreter",
+      "properties": {
+        "pdminterpreter.autoChange": {
+          "scope": "resource",
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically change interpreter based on PDM"
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

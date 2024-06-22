@@ -1,16 +1,69 @@
 // The module 'vscode' contains the VS Code extensibility API
 // Import the module and reference it with the alias vscode in your code below
 import * as vscode from 'vscode';
-import { Environment, PythonExtension } from '@vscode/python-extension';
+import { PythonExtension } from '@vscode/python-extension';
 import * as fs from 'fs';
 import CryptoJS from 'crypto-js';
 import * as path from 'path';
 import util from 'node:util';
+import { execFile as _execFile } from 'node:child_process';
 
 
-const execFile = util.promisify(require('node:child_process').execFile);
+const execFile = util.promisify(_execFile);
 
-export function showNotification(message: string, duration: number) {
+
+class Watcher {
+	readonly _watchers: Map<string, vscode.FileSystemWatcher>;
+	readonly _ctx: PDMContext;
+
+	constructor(ctx: PDMContext) {
+		this._watchers = new Map<string, vscode.FileSystemWatcher>();
+		this._ctx = ctx;
+	}
+
+	async enable(ws: vscode.WorkspaceFolder) {
+		this._ctx.logger.info('Enabling watcher for ' + ws.name);
+		if (this._watchers.has(ws.uri.fsPath)) {
+			this._ctx.logger.error('Watcher already enabled for ' + ws.name);
+			return;
+		}
+		const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(ws, '.pdm-python'));
+		watcher.onDidChange(async () => {
+			this._ctx.logger.info('File changed: ' + ws.name);
+			await Python.update_pdm_interpreter(this._ctx, ws.uri);
+		});
+		watcher.onDidCreate(async () => {
+			this._ctx.logger.info('File created: ' + ws.name);
+			await Python.update_pdm_interpreter(this._ctx, ws.uri);
+		});
+
+		await Python.update_pdm_interpreter(this._ctx, ws.uri);
+
+		this._watchers.set(ws.uri.fsPath, watcher);
+	}
+
+	disable(ws: vscode.WorkspaceFolder) {
+		this._ctx.logger.info('Disabling watcher for ' + ws.name);
+		const watcher = this._watchers.get(ws.uri.fsPath);
+		if (watcher) {
+			this._watchers.delete(ws.uri.fsPath);
+			watcher.dispose();
+		}
+	}
+
+	dispose() {
+		this._watchers.forEach((watcher) => watcher.dispose());
+		this._watchers.clear();
+	}
+};
+
+interface PDMContext {
+	readonly logger: vscode.LogOutputChannel;
+	readonly api: PythonExtension;
+	dispose(): void;
+};
+
+function showNotification(message: string, duration: number) {
 	vscode.window.withProgress(
 		{ location: vscode.ProgressLocation.Notification },
 		async (progress) => {
@@ -29,11 +82,6 @@ export function showNotification(message: string, duration: number) {
 	);
 }
 
-interface PDMContext {
-	readonly logger: vscode.LogOutputChannel;
-	readonly api: PythonExtension;
-};
-
 async function select_workspace() {
 	const ws_folders = vscode.workspace.workspaceFolders;
 	if (!ws_folders) {
@@ -47,7 +95,7 @@ async function select_workspace() {
 	return ws_folder;
 }
 
-async function execShell(cmd: string, args: string[], cwd: string | undefined = undefined): Promise<string> {
+async function execShell(cmd: string, args: string[], cwd: string | undefined = undefined) {
 	const { stdout } = await execFile(cmd, args, { cwd: cwd });
 	return stdout;
 }
@@ -115,7 +163,22 @@ namespace PDM {
 
 namespace Python {
 
-	export const update_interpreter = async (c: PDMContext, pdm_python_file: vscode.Uri) => {
+	export const update_interpreter = async (c: PDMContext, ws: vscode.WorkspaceFolder) => {
+		const python_bin_path = await PDM.get_active_python_bin(ws.uri);
+		c.logger.info('Python path: ' + python_bin_path);
+
+		const prompt = PDM.get_active_name(ws.uri, python_bin_path);
+
+		const active_env = c.api.environments.getActiveEnvironmentPath(ws);
+		if (active_env.path === python_bin_path.fsPath) {
+			return;
+		}
+
+		await c.api.environments.updateActiveEnvironmentPath(python_bin_path.fsPath, ws);
+		showNotification('Updated python interpreter in ' + ws.name + ' to ' + await prompt, 5000);
+	};
+
+	export const update_pdm_interpreter = async (c: PDMContext, pdm_python_file: vscode.Uri) => {
 		const ws = vscode.workspace.getWorkspaceFolder(pdm_python_file);
 		if (!ws) {
 			c.logger.error('No workspace folder');
@@ -123,39 +186,81 @@ namespace Python {
 		}
 		c.logger.info('Workspace folder: ' + ws.uri.fsPath);
 
-		const python_bin_path = await PDM.get_active_python_bin(ws.uri);
-		c.logger.info('Python path: ' + python_bin_path);
-
-		const prompt = PDM.get_active_name(ws.uri, python_bin_path);
-
-
-
-		await c.api.environments.updateActiveEnvironmentPath(python_bin_path.fsPath, ws);
-
-
-
-		showNotification('Updated python interpreter in ' + ws.name + ' to ' + await prompt, 5000);
+		await update_interpreter(c, ws);
 	};
 }
 
 
+function get_config(scope: vscode.ConfigurationScope | undefined = undefined) {
+	const conf = vscode.workspace.getConfiguration('pdminterpreter', scope);
+	return {
+		autoChange: conf.get<boolean>('autoChange', false),
+	};
+}
+
+async function create_ctx(): Promise<PDMContext> {
+	const logger = vscode.window.createOutputChannel('PDM Interpreter', { log: true });
+	const api = await PythonExtension.api();
+	await api.ready;
+
+	return {
+		logger: logger,
+		api: api,
+		dispose: () => { logger.dispose(); }
+	};
+
+}
+
+function create_watchers(ctx: PDMContext) {
+	const watchers = new Watcher(ctx);
+	vscode.workspace.workspaceFolders?.forEach(async (ws) => {
+		const conf = get_config(ws);
+		if (conf.autoChange) {
+			await watchers.enable(ws);
+		}
+	});
+	return watchers;
+}
+
 // This method is called when your extension is activated
 // Your extension is activated the very first time the command is executed
 export async function activate(context: vscode.ExtensionContext) {
-	const c: PDMContext = {
-		logger: vscode.window.createOutputChannel('PDM Interpreter', { log: true }),
-		api: await PythonExtension.api()
-	};
-	await c.api.ready;
-	c.logger.info('Python Extension API ready');
+	const ctx = await create_ctx();
+	context.subscriptions.push(ctx);
 
+	const watchers = create_watchers(ctx);
+	context.subscriptions.push(watchers);
 
-
-	const watcher = vscode.workspace.createFileSystemWatcher('**/.pdm-python').onDidChange(async (pdm_python_file) => {
-		c.logger.appendLine('File changed: ' + pdm_python_file.fsPath);
-		await Python.update_interpreter(c, pdm_python_file);
+	const conf_watcher = vscode.workspace.onDidChangeConfiguration((e) => {
+		vscode.workspace.workspaceFolders?.forEach(async (ws) => {
+			if (e.affectsConfiguration('pdminterpreter.autoChange', ws)) {
+				const conf = get_config(ws);
+				if (conf.autoChange) {
+					await watchers.enable(ws);
+				}
+				else {
+					watchers.disable(ws);
+				}
+			}
+		});
 	});
-	context.subscriptions.push(watcher);
+	context.subscriptions.push(conf_watcher);
+
+	const ws_watcher = vscode.workspace.onDidChangeWorkspaceFolders((e) => {
+		e.removed.forEach((ws) => {
+			ctx.logger.info("Removed: " + ws.name);
+			watchers.disable(ws);
+		});
+		e.added.forEach(async (ws) => {
+			ctx.logger.info("Added: " + ws.name);
+			const conf = get_config(ws);
+			if (conf.autoChange) {
+				await watchers.enable(ws);
+			}
+		});
+	});
+	context.subscriptions.push(ws_watcher);
+
 
 	// The command has been defined in the package.json file
 	// Now provide the implementation of the command with registerCommand
@@ -169,8 +274,7 @@ export async function activate(context: vscode.ExtensionContext) {
 			if (!selected_venv) {
 				return;
 			}
-			const result = await PDM.exec(["use", "--venv", selected_venv], ws_folder.uri);
-			console.log(result);
+			await PDM.exec(["use", "--venv", selected_venv], ws_folder.uri);
 		} catch (e: any) {
 			vscode.window.showErrorMessage(e.message);
 			return;
@@ -179,9 +283,22 @@ export async function activate(context: vscode.ExtensionContext) {
 
 	});
 	context.subscriptions.push(select_interpreter);
+
+	const update_interpreter = vscode.commands.registerCommand('pdminterpreter.update', async () => {
+		try {
+			const ws_folder = await select_workspace();
+			Python.update_interpreter(ctx, ws_folder);
+		} catch (e: any) {
+			vscode.window.showErrorMessage(e.message);
+			return;
+		}
+
+
+	});
+	context.subscriptions.push(update_interpreter);
+
+	ctx.logger.info('Python Extension API ready');
 }
 
 // This method is called when your extension is deactivated
-export async function deactivate(): Promise<void> {
-
-};
+export function deactivate(): void { };
